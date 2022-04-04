@@ -92,6 +92,7 @@ LAMBDA_JAR_FILE_NAME = "original_lambda_archive.jar"
 
 # default timeout in seconds
 LAMBDA_DEFAULT_TIMEOUT = 3
+DEFAULT_BATCHING_WINDOW_IN_SECONDS = 0
 
 INVALID_PARAMETER_VALUE_EXCEPTION = "InvalidParameterValueException"
 VERSION_LATEST = LambdaFunction.QUALIFIER_LATEST
@@ -451,6 +452,14 @@ def build_mapping_obj(data) -> Dict:
         mapping["StartingPosition"] = LAMBDA_DEFAULT_STARTING_POSITION
     batch_size = check_batch_size_range(source_arn, batch_size)
     mapping["BatchSize"] = batch_size
+
+    if data.get("DestinationConfig"):
+        mapping["DestinationConfig"] = data.get("DestinationConfig")
+
+    mapping["MaximumBatchingWindowInSeconds"] = data.get(
+        "MaximumBatchingWindowInSeconds", DEFAULT_BATCHING_WINDOW_IN_SECONDS
+    )
+    mapping["MaximumRetryAttempts"] = data.get("MaximumRetryAttempts", -1)
     return mapping
 
 

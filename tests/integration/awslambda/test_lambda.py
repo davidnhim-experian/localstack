@@ -154,6 +154,39 @@ PROVIDED_TEST_RUNTIMES = [
     ),
 ]
 
+lambda_role = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+s3_lambda_permission = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sqs:*",
+                "kinesis:DescribeStream",
+                "kinesis:DescribeStreamSummary",
+                "kinesis:GetRecords",
+                "kinesis:GetShardIterator",
+                "kinesis:ListShards",
+                "kinesis:ListStreams",
+                "kinesis:SubscribeToShard",
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+            ],
+            "Resource": ["*"],
+        }
+    ],
+}
+
 
 @pytest.fixture
 def check_lambda_logs(logs_client):
@@ -335,6 +368,147 @@ class TestLambdaAPI:
             RevisionId="r1",
         )
         assert 200 == resp["ResponseMetadata"]["HTTPStatusCode"]
+
+    def test_lambda_destination_config(
+        self,
+        lambda_client,
+        create_lambda_function,
+        sqs_client,
+        sqs_create_queue,
+        iam_create_role_with_policy,
+        kinesis_client,
+    ):
+        try:
+            function_name = f"lambda_func-{short_uid()}"
+            role = f"test-lambda-role-{short_uid()}"
+            policy_name = f"test-lambda-policy-{short_uid()}"
+            role_arn = iam_create_role_with_policy(
+                RoleName=role,
+                PolicyName=policy_name,
+                RoleDefinition=lambda_role,
+                PolicyDefinition=s3_lambda_permission,
+            )
+            TEST_LAMBDA = """
+def handler(event, context):
+    import json
+    print(json.dumps(event))
+    if event and event.get("Records"):
+        raise Exception("this should trigger S3 OnFailure")
+    return event
+                """
+            zip_file = testutil.create_lambda_archive(
+                TEST_LAMBDA, get_content=True, runtime=LAMBDA_RUNTIME_PYTHON37
+            )
+
+            response = create_lambda_function(
+                zip_file=zip_file,
+                func_name=function_name,
+                runtime=LAMBDA_RUNTIME_PYTHON36,
+                role=role_arn,
+            )
+
+            function_arn = response["CreateFunctionResponse"]["FunctionArn"]
+            queue_success = sqs_create_queue()
+            queue_failure = sqs_create_queue()
+
+            success_queue_arn = sqs_client.get_queue_attributes(
+                QueueUrl=queue_success, AttributeNames=["QueueArn"]
+            )["Attributes"]["QueueArn"]
+            failure_queue_arn = sqs_client.get_queue_attributes(
+                QueueUrl=queue_failure, AttributeNames=["QueueArn"]
+            )["Attributes"]["QueueArn"]
+            # adding event invoke config
+            response = lambda_client.put_function_event_invoke_config(
+                FunctionName=function_name,
+                DestinationConfig={
+                    "OnSuccess": {"Destination": success_queue_arn},
+                    "OnFailure": {"Destination": failure_queue_arn},
+                },
+            )
+            lambda_client.invoke(FunctionName=function_name, InvocationType="Event")
+
+            def verify_message_received():
+                result = sqs_client.receive_message(QueueUrl=queue_success)
+                msg = result["Messages"][0]
+                body = json.loads(msg["Body"])
+                assert body["requestContext"]["condition"] == "Success"
+                assert (
+                    function_arn in body["requestContext"]["functionArn"]
+                )  # AWS will also contain the versio e.g. <arn>:$LATEST
+                assert not body["requestPayload"]
+
+            retry(verify_message_received, retries=100, sleep=5)
+
+            # test destination-config for create_event_source_mapping
+            kinesis_name = f"test-kinesis-{short_uid()}"
+            kinesis_client.create_stream(StreamName=kinesis_name, ShardCount=1)
+
+            result = kinesis_client.describe_stream(StreamName=kinesis_name)["StreamDescription"]
+            kinesis_arn = result["StreamARN"]
+
+            # wait for stream-status "ACTIVE"
+            status = result["StreamStatus"]
+            if status != "ACTIVE":
+
+                def check_stream_active():
+                    state = kinesis_client.describe_stream(StreamName=kinesis_name)[
+                        "StreamDescription"
+                    ]["StreamStatus"]
+                    if state != "ACTIVE":
+                        raise Exception(f"StreamStatus is {state}")
+
+                retry(check_stream_active, retries=6, sleep=1.0, sleep_before=2.0)
+
+            queue_event_source_mapping = sqs_create_queue()
+            queue_failure_event_source_mapping_arn = sqs_client.get_queue_attributes(
+                QueueUrl=queue_event_source_mapping, AttributeNames=["QueueArn"]
+            )["Attributes"]["QueueArn"]
+            destination_config = {
+                "OnFailure": {"Destination": queue_failure_event_source_mapping_arn}
+            }
+
+            result = lambda_client.create_event_source_mapping(
+                FunctionName=function_name,
+                BatchSize=1,
+                StartingPosition="TRIM_HORIZON",
+                EventSourceArn=kinesis_arn,
+                MaximumBatchingWindowInSeconds=1,
+                MaximumRetryAttempts=1,
+                DestinationConfig=destination_config,
+            )
+
+            event_source_mapping_uuid = result["UUID"]
+            event_source_mapping_state = result["State"]
+            if event_source_mapping_state != "Enabled":
+
+                def check_mapping_state():
+                    state = lambda_client.get_event_source_mapping(UUID=event_source_mapping_uuid)[
+                        "State"
+                    ]
+                    if state != "Enabled":
+                        raise Exception(f"State is {state}")
+
+                retry(check_mapping_state, retries=6, sleep_before=2.0, sleep=1.0)
+
+            message = {"input": "hello", "value": "world"}
+            result = kinesis_client.put_record(
+                StreamName=kinesis_name, Data=to_bytes(json.dumps(message)), PartitionKey="custom"
+            )
+
+            def verify_failure_received():
+                result = sqs_client.receive_message(QueueUrl=queue_event_source_mapping)
+                msg = result["Messages"][0]
+                body = json.loads(msg["Body"])
+                assert body["requestContext"]["condition"] == "RetryAttemptsExhausted"
+                assert body["requestContext"]["approximateInvokeCount"] == 2
+                assert body["KinesisBatchInfo"]["batchSize"] == 1
+                assert body["KinesisBatchInfo"]["streamArn"] == kinesis_arn
+
+            retry(verify_failure_received, retries=100, sleep=5, sleep_before=5)
+
+        finally:
+            kinesis_client.delete_stream(StreamName=kinesis_name, EnforceConsumerDeletion=True)
+            lambda_client.delete_event_source_mapping(UUID=event_source_mapping_uuid)
 
     def test_lambda_asynchronous_invocations(self, lambda_client, create_lambda_function):
         function_name = f"lambda_func-{short_uid()}"
